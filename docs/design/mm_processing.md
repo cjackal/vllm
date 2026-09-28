@@ -78,10 +78,13 @@ GPU-side fusion is controlled by `multimodal_config.mm_device_do_normalize`:
 - The flag is **enabled by default** for all models that support it.
 - Currently, it’s on by default for these architectures:
 
-| name         | Architecture                         | Example HF Models                   |
-|--------------|--------------------------------------|-------------------------------------|
-| `qwen2-vl`   | `Qwen2VLForConditionalGeneration`    | `Qwen/Qwen2-VL-2B-Instruct`, etc.   |
-| `qwen2.5-vl` | `Qwen2_5_VLForConditionalGeneration` | `Qwen/Qwen2.5-VL-3B-Instruct`, etc. |
+| name         | Architecture                         | Example HF Models                    |
+|--------------|--------------------------------------|--------------------------------------|
+| `glm-4v`     | `Glm4vForConditionalGeneration`      | `zai-org/GLM-4.1V-9B-Thinking`, etc. |
+| `glm-5-next` | `Glm5NextForConditionalGeneration`   | `zai-org/GLM-5.3-Flash`              |
+| `glm-ocr`    | `GlmOcrForConditionalGeneration`     | `zai-org/GLM-OCR`                    |
+| `qwen2-vl`   | `Qwen2VLForConditionalGeneration`    | `Qwen/Qwen2-VL-2B-Instruct`, etc.    |
+| `qwen2.5-vl` | `Qwen2_5_VLForConditionalGeneration` | `Qwen/Qwen2.5-VL-3B-Instruct`, etc.  |
 
 #### Key Properties and Gains
 
