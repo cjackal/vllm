@@ -110,6 +110,7 @@ class SymmMemCommunicator:
             )
             return
         self.force_multimem = force_multimem
+        self.stream = torch.cuda.Stream(device=self.device)
         self.disabled = False
         if envs.VLLM_BATCH_INVARIANT:
             self.disabled = True
@@ -131,26 +132,31 @@ class SymmMemCommunicator:
             return None
         if out is None:
             out = torch.empty_like(inp)
-        self.buffer[: inp.numel()].copy_(inp.view(-1))
+        current_stream = torch.cuda.current_stream()
+        self.stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.stream):
+            self.buffer[: inp.numel()].copy_(inp.view(-1))
 
-        # Determine which algorithm to use
-        use_multimem = False
-        if self.force_multimem is not None:
-            # Test override: use forced setting
-            use_multimem = self.force_multimem
-        else:
-            # Normal logic: use multimem for supported world sizes
-            use_multimem = (
-                self.world_size in self._WORLD_SIZES_MULTIMEM[self.device_capability]
-            )
+            # Determine which algorithm to use
+            use_multimem = False
+            if self.force_multimem is not None:
+                # Test override: use forced setting
+                use_multimem = self.force_multimem
+            else:
+                # Normal logic: use multimem for supported world sizes
+                use_multimem = (
+                    self.world_size
+                    in self._WORLD_SIZES_MULTIMEM[self.device_capability]
+                )
 
-        if use_multimem:
-            torch.ops.symm_mem.multimem_all_reduce_(
-                self.buffer[: inp.numel()], "sum", self.group.group_name
-            )
-        else:
-            torch.ops.symm_mem.two_shot_all_reduce_(
-                self.buffer[: inp.numel()], "sum", self.group.group_name
-            )
-        out.copy_(self.buffer[: inp.numel()].view(out.shape))
+            if use_multimem:
+                torch.ops.symm_mem.multimem_all_reduce_(
+                    self.buffer[: inp.numel()], "sum", self.group.group_name
+                )
+            else:
+                torch.ops.symm_mem.two_shot_all_reduce_(
+                    self.buffer[: inp.numel()], "sum", self.group.group_name
+                )
+            out.copy_(self.buffer[: inp.numel()].view(out.shape))
+        current_stream.wait_stream(self.stream)
         return out
