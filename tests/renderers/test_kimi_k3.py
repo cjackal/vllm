@@ -143,6 +143,22 @@ def test_k3_media_io_defaults_preserve_original_mode():
     ) == {"image": {"image_mode": None, "rgba_background_color": (0, 0, 0)}}
 
 
+def test_k3_video_loader_defaults_yield_to_overrides():
+    video_defaults = {"video_backend": "kimi_k3", "num_frames": -1}
+
+    assert _merge_k3_media_io_kwargs(None, video_defaults) == {
+        "image": {"image_mode": None},
+        "video": video_defaults,
+    }
+
+    # Server-/request-level video kwargs take precedence over the K3 loader.
+    merged = _merge_k3_media_io_kwargs(
+        {"video": {"video_backend": "opencv", "num_frames": 8}}, video_defaults
+    )
+    assert merged is not None
+    assert merged["video"] == {"video_backend": "opencv", "num_frames": 8}
+
+
 def test_apply_chat_template_forces_tokenize_and_pins_return_dict():
     tokenizer = StubTokenizer([7, 8, 9])
     renderer = _make_renderer(tokenizer)

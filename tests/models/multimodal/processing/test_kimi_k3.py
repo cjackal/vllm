@@ -23,10 +23,16 @@ from vllm.distributed.ec_transfer.ec_connector.utils import (
 from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
-from vllm.multimodal.utils import encode_image_url
+from vllm.multimodal.utils import encode_image_url, encode_video_url
 from vllm.platforms import current_platform
 from vllm.renderers import ChatParams, renderer_from_config
 from vllm.renderers.chat_utils.item_tracker import _get_embeds_data
+from vllm.transformers_utils.processors.kimi_k3 import (
+    get_kimi_k3_frame_resize,
+    get_kimi_k3_max_video_frames,
+    get_kimi_k3_max_video_tokens,
+    plan_kimi_k3_video,
+)
 from vllm.transformers_utils.processors.kimi_k25_vision_fused import (
     KimiK25FusedVisionProcessor,
 )
@@ -211,3 +217,153 @@ def test_mm_device_do_normalize():
     torch.testing.assert_close(
         output, normalized_values.flatten(1).to(device), rtol=1.6e-2, atol=1e-5
     )
+
+
+@pytest.fixture(scope="module")
+def k3_processor():
+    ctx = build_model_context(_MODEL_ID, limit_mm_per_prompt={"image": 1, "video": 1})
+    return MULTIMODAL_REGISTRY.create_processor(ctx.model_config)
+
+
+def _video_block(processor, size: tuple[int, int], chunks: list[tuple[str, int]]):
+    """The SGLang-format token block for one video."""
+    tokenizer = processor.info.get_tokenizer()
+
+    def encode(text: str) -> list[int]:
+        return tokenizer.encode(text, add_special_tokens=False)
+
+    width, height = size
+    token_ids = encode(f"<|media_begin|>video {width}x{height}<|media_content|>")
+    for timestamp, num_tokens in chunks:
+        token_ids += encode(timestamp) + [processor.info.media_token_id] * num_tokens
+    return token_ids + encode("<|media_end|>")
+
+
+def _placeholder_tokens(out, modality: str = "video") -> list[int]:
+    [placeholder] = out["mm_placeholders"][modality]
+    start = placeholder.offset
+    return out["prompt_token_ids"][start : start + placeholder.length]
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "num_frames", "fps", "expected"),
+    [
+        # SGLang caps a 60 s, 30 fps 1080p clip at 60 frames (15 chunks).
+        (1920, 1080, 1800, 30.0, 60),
+        # A short clip is sampled at the checkpoint's 8 fps.
+        (640, 480, 60, 30.0, 16),
+        # A source slower than 8 fps keeps every frame.
+        (320, 240, 50, 5.0, 50),
+        # Padding grows each frame to 4225 tokens, so the token budget
+        # (not the patch budget) caps the count.
+        (1805, 1805, 400, 8.0, 36),
+        # Tiny frames hit the default frame cap.
+        (28, 28, 1_000_000, 30.0, 1024),
+    ],
+)
+def test_video_plan_stays_within_budget(
+    k3_processor, width: int, height: int, num_frames: int, fps: float, expected: int
+):
+    cfg = k3_processor.info.image_processor.media_proc_cfg
+    indices = plan_kimi_k3_video(num_frames, fps, width, height, cfg)
+    assert indices == (
+        np.linspace(0, num_frames - 1, expected).round().astype(int).tolist()
+    )
+
+    resize = get_kimi_k3_frame_resize(width, height, cfg)
+    patch = cfg["patch_size"]
+    frame_patches = ((resize["new_width"] + resize["pad_width"]) // patch) * (
+        (resize["new_height"] + resize["pad_height"]) // patch
+    )
+    num_chunks = -(-expected // cfg["temporal_merge_kernel_size"])
+    assert expected * frame_patches <= cfg["in_patch_limit_video"]
+    assert num_chunks * resize["num_tokens"] <= get_kimi_k3_max_video_tokens(cfg)
+
+
+def test_dummy_video_fills_video_budget(k3_processor):
+    """Profiling must reach the per-video token budget the encoder cache uses."""
+    info = k3_processor.info
+    cfg = info.image_processor.media_proc_cfg
+    size = info.get_dummy_video_frame_size()
+    num_frames = get_kimi_k3_max_video_frames(size.width, size.height, cfg)
+    num_chunks = -(-num_frames // cfg["temporal_merge_kernel_size"])
+    tokens = (
+        num_chunks
+        * get_kimi_k3_frame_resize(size.width, size.height, cfg)["num_tokens"]
+    )
+    max_tokens = info.get_mm_max_tokens_per_item(8192, {"image": 1, "video": 1})
+    assert tokens == max_tokens["video"] == get_kimi_k3_max_video_tokens(cfg)
+
+
+def test_video_prompt_and_inputs(k3_processor):
+    """A video becomes one block of timestamped 4-frame chunks, as in SGLang."""
+    rng = np.random.default_rng(0)
+    frames = rng.integers(0, 256, (12, 112, 84, 3), dtype=np.uint8)
+    metadata = {"fps": 4.0, "total_num_frames": 12, "frames_indices": list(range(12))}
+    prompt = k3_processor.dummy_inputs.get_dummy_text({"video": 1})
+    out = k3_processor(
+        prompt,
+        mm_items=k3_processor.info.parse_mm_data({"video": [(frames, metadata)]}),
+    )
+
+    item = out["mm_kwargs"]["video"][0]
+    assert item["video_grid_thws"].data.tolist() == [[4, 8, 6]] * 3
+    assert item["video_chunk_timestamps"].data.tolist() == [0, 1000, 2000]
+    assert item["video_pixel_values"].data.shape[0] == 12 * 8 * 6
+    assert item["video_pixel_values"].data.dtype == torch.uint8
+    chunks = [("00:00:00.000", 12), ("00:00:01.000", 12), ("00:00:02.000", 12)]
+    assert _placeholder_tokens(out) == _video_block(k3_processor, (84, 112), chunks)
+    assert out["mm_placeholders"]["video"][0].get_num_embeds() == 36
+
+
+def test_video_subsamples_decoded_frames(k3_processor):
+    """Frames decoded beyond the plan (e.g. by another loader) are subsampled."""
+    frames = np.zeros((30, 56, 56, 3), dtype=np.uint8)
+    metadata = {"fps": 30.0, "total_num_frames": 30, "frames_indices": list(range(30))}
+    prompt = k3_processor.dummy_inputs.get_dummy_text({"video": 1})
+    out = k3_processor(
+        prompt,
+        mm_items=k3_processor.info.parse_mm_data({"video": [(frames, metadata)]}),
+    )
+
+    # 8 fps keeps 8 of 30 frames, at positions 0, 4, 8, 12, 17, 21, 25, 29.
+    item = out["mm_kwargs"]["video"][0]
+    assert item["video_grid_thws"].data.tolist() == [[4, 4, 4]] * 2
+    assert item["video_chunk_timestamps"].data.tolist() == [0, 566]
+    chunks = [("00:00:00.000", 4), ("00:00:00.566", 4)]
+    assert _placeholder_tokens(out) == _video_block(k3_processor, (56, 56), chunks)
+
+
+def test_video_chat():
+    """A `video_url` part renders K3's video block through the chat path."""
+    config = VllmConfig(
+        model_config=ModelConfig(
+            _MODEL_ID,
+            tokenizer_mode="kimi_k3",
+            trust_remote_code=True,
+            limit_mm_per_prompt={"video": 1},
+            mm_processor_cache_gb=0,
+        ),
+        # Rendering needs no KV cache; keep CPU MLA and hybrid-cache defaults aligned.
+        cache_config=CacheConfig(enable_prefix_caching=False),
+        device_config=DeviceConfig(device="cpu"),
+    )
+    rng = np.random.default_rng(0)
+    frames = rng.integers(0, 256, (6, 56, 56, 3), dtype=np.uint8)
+    content = [
+        {"type": "video_url", "video_url": {"url": encode_video_url(frames)}},
+        {"type": "text", "text": "Describe the video."},
+    ]
+    renderer = renderer_from_config(config)
+    try:
+        _, prompts = renderer.render_chat(
+            [[{"role": "user", "content": content}]], ChatParams()
+        )
+        processor = renderer.get_mm_processor()
+        # A JPEG frame sequence carries no frame rate, so it counts as 1 fps.
+        chunks = [("00:00:00.000", 4), ("00:00:04.000", 4)]
+        assert _placeholder_tokens(prompts[0]) == _video_block(
+            processor, (56, 56), chunks
+        )
+    finally:
+        renderer.shutdown()

@@ -17,6 +17,7 @@ from transformers import AutoVideoProcessor, Qwen3VLVideoProcessor
 from transformers.video_utils import VideoMetadata
 
 from vllm.assets.base import get_vllm_public_assets
+from vllm.models.kimi_k3.common.mm_preprocess import KimiK3VideoBackend
 from vllm.models.minimax_m3.common.mm_preprocess import MiniMaxM3VideoBackend
 from vllm.multimodal.video import (
     PYNVVIDEOCODEC_VIDEO_BACKEND,
@@ -49,6 +50,7 @@ from vllm.multimodal.video_decoders.pynvvideocodec import (
 )
 from vllm.platforms import current_platform
 from vllm.transformers_utils.processor import get_video_processor_cls_name_from_config
+from vllm.transformers_utils.processors.kimi_k3 import plan_kimi_k3_video
 
 from .utils import (
     create_edit_list_trimmed_video,
@@ -1858,6 +1860,42 @@ def dummy_video_path(tmp_path):
     video_path = tmp_path / "test_RGB_video.mp4"
     create_video_from_image(str(image_path), str(video_path), num_frames=1800, fps=30)
     return video_path
+
+
+# `media_proc_cfg` of the moonshotai/Kimi-K3 checkpoint.
+_KIMI_K3_MEDIA_PROC_CFG = {
+    "patch_size": 14,
+    "merge_kernel_size": 2,
+    "patch_limit_on_one_side": 512,
+    "in_patch_limit": 65536,
+    "in_patch_limit_each_frame": 16384,
+    "in_patch_limit_video": 655360,
+    "sample_fps": 8.0,
+    "temporal_merge_kernel_size": 4,
+    "timestamp_mode": "hh:mm:ss.fff",
+    "max_num_frames_each_video": None,
+    "fixed_output_tokens": None,
+}
+
+
+@pytest.mark.parametrize("num_frames", [-1, 10])
+def test_kimi_k3_backend_decodes_planned_frames(dummy_video_path, num_frames: int):
+    """The decoder passes the frame size, so only planned frames are decoded."""
+    frames, metadata = KimiK3VideoBackend.load_bytes(
+        dummy_video_path.read_bytes(),
+        num_frames=num_frames,
+        media_proc_cfg=_KIMI_K3_MEDIA_PROC_CFG,
+        backend="opencv",
+    )
+    height, width = frames.shape[1:3]
+    cfg = dict(_KIMI_K3_MEDIA_PROC_CFG)
+    if num_frames > 0:
+        cfg["max_num_frames_each_video"] = num_frames
+    planned = plan_kimi_k3_video(
+        metadata["total_num_frames"], metadata["fps"], width, height, cfg
+    )
+    assert metadata["frames_indices"] == planned
+    assert len(frames) == len(planned) < metadata["total_num_frames"]
 
 
 # ============================================================================
